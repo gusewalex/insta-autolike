@@ -1,40 +1,37 @@
-name: autolike
+name: Instagram read-only monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # GitHub не гарантує точність: запуски часто запізнюються на кілька хвилин
+    - cron: "*/10 * * * *"
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Скасувати паузу після обмеження Instagram"
-        type: boolean
-        default: false
 
 concurrency:
-  group: autolike
+  group: instagram-readonly-monitor
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 7
     env:
-      TZ: Europe/Kyiv                      # для «тихих годин» (01:00-07:00)
+      TZ: Europe/Kyiv
       IG_USERNAME: ${{ secrets.IG_USERNAME }}
       IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
-      IG_TOTP_SEED: ${{ secrets.IG_TOTP_SEED }}   # необов'язково, лише для 2FA через додаток
+      IG_TOTP_SEED: ${{ secrets.IG_TOTP_SEED }}
       STATE_KEY: ${{ secrets.STATE_KEY }}
-      FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
-      RUN_BUDGET_SEC: "240"
-      LOG_USERNAMES: "0"                   # у публічному репозиторії логи бачать усі
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      FEED_MAX_AGE_HOURS: "48"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
@@ -42,41 +39,44 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Update instagrapi
-        run: |
-          pip install --no-cache-dir --upgrade "instagrapi>=3.2.3"
-          pip show instagrapi
-
       - name: Restore encrypted state
         uses: actions/cache/restore@v4
         with:
           path: state.enc
-          key: autolike-${{ github.run_id }}
-          restore-keys: autolike-
+          key: instagram-monitor-${{ github.run_id }}
+          restore-keys: |
+            instagram-monitor-
 
       - name: Decrypt state
+        shell: bash
         run: |
+          set -euo pipefail
           if [ -f state.enc ]; then
+            if [ -z "$STATE_KEY" ]; then
+              echo "STATE_KEY secret is missing." >&2
+              exit 1
+            fi
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in state.enc | tar -xz
           fi
 
-      - name: Run
-        run: python insta_autolike.py --once
+      - name: Run read-only monitor
+        run: python insta_monitor.py --once
 
       - name: Encrypt state
         if: always()
+        shell: bash
         run: |
-          files=""
-          [ -f session.json ] && files="$files session.json"
-          [ -f state.json ] && files="$files state.json"
-          if [ -n "$files" ]; then
-            rm -f state.enc
-            tar -cz $files | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STATE_KEY -out state.enc
+          set -euo pipefail
+          files=()
+          [ -f session.json ] && files+=(session.json)
+          [ -f state.json ] && files+=(state.json)
+          if [ "${#files[@]}" -gt 0 ]; then
+            tar -czf - "${files[@]}" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STATE_KEY -out state.enc
           fi
 
       - name: Save encrypted state
-        if: always()
+        if: always() && hashFiles('state.enc') != ''
         uses: actions/cache/save@v4
         with:
           path: state.enc
-          key: autolike-${{ github.run_id }}
+          key: instagram-monitor-${{ github.run_id }}
