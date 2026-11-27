@@ -48,10 +48,15 @@ jobs:
           key: autolike-${{ github.run_id }}
           restore-keys: autolike-
 
-      - name: Decrypt state
+      - name: Decrypt state or seed session
+        env:
+          IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
         run: |
           if [ -f state.enc ]; then
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in state.enc | tar -xz
+          fi
+          if [ ! -f session.json ] && [ -n "$IG_SESSION_B64" ]; then
+            echo "$IG_SESSION_B64" | base64 -d > session.json
           fi
 
       - name: Run
