@@ -148,30 +148,45 @@ def in_quiet_hours() -> bool:
 
 def poll_feed(cl: Client, following: set[int], state: dict) -> None:
     now = utcnow()
-    new_count = 0
+    stats = {"усього": 0, "не від підписок": 0, "вже лайкнуто": 0,
+             "старші за ліміт": 0, "пропущено випадково": 0, "вже в черзі/оброблено": 0, "додано в чергу": 0}
+    newest_age = None
     for media in fetch_feed_posts(cl):
+        stats["усього"] += 1
         pk = str(media.pk)
+        age_min = (now - media.taken_at).total_seconds() / 60
+        newest_age = age_min if newest_age is None else min(newest_age, age_min)
+
         if pk in state["scheduled"] or pk in state["done"]:
+            stats["вже в черзі/оброблено"] += 1
             continue
         if int(media.user.pk) not in following:
+            stats["не від підписок"] += 1
             continue  # рекомендації не від підписок
         if media.has_liked:
+            stats["вже лайкнуто"] += 1
             state["done"].append(pk)
             continue
-
-        age_min = (now - media.taken_at).total_seconds() / 60
-        if age_min > MAX_POST_AGE_MIN or random.random() < SKIP_PROBABILITY:
+        if age_min > MAX_POST_AGE_MIN:
+            stats["старші за ліміт"] += 1
+            state["done"].append(pk)
+            continue
+        if random.random() < SKIP_PROBABILITY:
+            stats["пропущено випадково"] += 1
             state["done"].append(pk)
             continue
 
         due = media.taken_at + timedelta(minutes=LIKE_DELAY_MIN + random.uniform(0, LIKE_JITTER_MAX_MIN))
         due = max(due, now + timedelta(seconds=random.uniform(5, 60)))
         state["scheduled"][pk] = due.isoformat()
-        new_count += 1
+        stats["додано в чергу"] += 1
         who = f"@{media.user.username}" if LOG_USERNAMES else "акаунта зі стрічки"
         log.info("У чергу: пост від %s, лайк о %s UTC", who, due.strftime("%H:%M:%S"))
-    if new_count:
-        save_state(state)
+
+    log.info("Стрічка: %s", ", ".join(f"{k}={v}" for k, v in stats.items()))
+    if newest_age is not None:
+        log.info("Найновіший пост у стрічці опублікований %.0f хв тому", newest_age)
+    save_state(state)
 
 
 def process_due(cl: Client, state: dict, like_times: list[datetime]) -> None:
