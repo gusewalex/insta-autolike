@@ -97,6 +97,9 @@ def login() -> Client:
         return c.totp_generate_code(totp_seed) if totp_seed else ""
 
     cl = fresh_client()
+    if not SESSION_FILE.exists():
+        log.warning("Файл session.json не знайдено: секрет IG_SESSION_B64 не заданий або порожній. "
+                    "Вхід за паролем із GitHub зазвичай блокується Instagram.")
     if SESSION_FILE.exists():
         try:
             cl.load_settings(SESSION_FILE)
@@ -289,7 +292,7 @@ def main() -> int:
             "Створіть сесію на своєму комп'ютері (--login-only) і додайте її в секрет IG_SESSION_B64. "
             "Наступна спроба через %s год.", type(e).__name__, e, BLOCK_HOURS)
         set_blocked(state, BLOCK_HOURS)
-        return 0
+        return 1  # червоний статус у Actions, щоб збій було видно
 
     if args.loop:
         while not is_blocked(state):
