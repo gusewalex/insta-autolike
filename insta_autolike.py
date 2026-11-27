@@ -4,7 +4,8 @@
 Режими:
   python insta_autolike.py --once        один прохід (для GitHub Actions, режим за замовчуванням)
   python insta_autolike.py --loop        працює постійно (для VPS / власного комп'ютера)
-  python insta_autolike.py --login-only  лише увійти й створити session.json
+  python insta_autolike.py --login-only  лише увійти за паролем і створити session.json
+  python insta_autolike.py --from-sessionid  створити session.json із cookie sessionid з браузера (змінна IG_SESSIONID)
 
 УВАГА: це неофіційна автоматизація, вона порушує правила Instagram.
 Є ризик обмежень або блокування акаунта. Використовуйте на власний ризик.
@@ -19,6 +20,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 from instagrapi import Client
 from instagrapi.exceptions import (
@@ -27,6 +29,7 @@ from instagrapi.exceptions import (
     LoginRequired,
     PleaseWaitFewMinutes,
     RateLimitError,
+    TwoFactorRequired,
 )
 from instagrapi.extractors import extract_media_v1
 
@@ -36,7 +39,9 @@ LIKE_JITTER_MAX_MIN = 6         # + випадкові 0..N хвилин
 MAX_POST_AGE_MIN = 120          # не лайкаємо пости старші за стільки хвилин
 MAX_LIKES_PER_HOUR = 20         # запобіжник
 SKIP_PROBABILITY = 0.1          # частку постів випадково пропускаємо
-QUIET_HOURS = (1, 7)            # з 01:00 до 07:00 (за TZ) не діємо
+# Тиха година вимкнена (працюємо цілодобово). Щоб увімкнути, додайте в workflow змінну, наприклад QUIET_HOURS: "1-7".
+_q = os.environ.get("QUIET_HOURS", "").strip()
+QUIET_HOURS = tuple(int(x) for x in _q.split("-")) if _q else None
 FOLLOWING_REFRESH_H = 6         # як часто оновлювати список підписок
 BLOCK_HOURS = 3                 # пауза після обмеження від Instagram
 RUN_BUDGET_SEC = int(os.environ.get("RUN_BUDGET_SEC", "240"))   # скільки один прохід чекає на «дозрілі» лайки
@@ -113,7 +118,13 @@ def login() -> Client:
             log.warning("Збережена сесія не працює (%s), пробую вхід за паролем", type(e).__name__)
             cl = fresh_client()
 
-    cl.login(username, password, verification_code=code_for(cl))
+    try:
+        cl.login(username, password, verification_code=code_for(cl))
+    except TwoFactorRequired:
+        if not sys.stdin.isatty():
+            raise
+        code = input("Введіть код двофакторної автентифікації (SMS або з додатка): ").strip()
+        cl.login(username, password, verification_code=code)
     cl.dump_settings(SESSION_FILE)
     log.info("Новий вхід виконано, сесію збережено")
     return cl
@@ -131,19 +142,36 @@ def get_following(cl: Client, state: dict) -> set[int]:
     return set(state["following"])
 
 
-def fetch_feed_posts(cl: Client):
-    feed = cl.get_timeline_feed()
-    for item in feed.get("feed_items", []):
-        raw = item.get("media_or_ad")
-        if not raw or raw.get("ad_id"):
-            continue
+def fetch_feed_posts(cl: Client, pages: int = 2):
+    """Читає до `pages` сторінок стрічки (спершу як «оновлення стрічки», далі пагінація)."""
+    max_id = None
+    for page in range(pages):
         try:
-            yield extract_media_v1(raw)
-        except Exception:
-            continue
+            if page == 0:
+                feed = cl.get_timeline_feed(reason="pull_to_refresh")
+            else:
+                feed = cl.get_timeline_feed(reason="pagination", max_id=max_id)
+        except (TypeError, ValueError):  # інша версія бібліотеки не приймає ці параметри
+            feed = cl.get_timeline_feed() if page == 0 else None
+        if not feed:
+            break
+        for item in feed.get("feed_items", []):
+            raw = item.get("media_or_ad")
+            if not raw or raw.get("ad_id"):
+                continue
+            try:
+                yield extract_media_v1(raw)
+            except Exception:
+                continue
+        max_id = feed.get("next_max_id")
+        if not max_id or not feed.get("more_available", True):
+            break
+        time.sleep(random.uniform(2, 5))
 
 
 def in_quiet_hours() -> bool:
+    if not QUIET_HOURS:
+        return False
     start, end = QUIET_HOURS
     return start <= datetime.now().hour < end
 
@@ -261,7 +289,21 @@ def main() -> int:
     mode.add_argument("--once", action="store_true", help="один прохід (за замовчуванням)")
     mode.add_argument("--loop", action="store_true", help="працювати постійно")
     mode.add_argument("--login-only", action="store_true", help="лише створити session.json")
+    mode.add_argument("--from-sessionid", action="store_true",
+                      help="створити session.json із cookie sessionid (змінна IG_SESSIONID)")
     args = parser.parse_args()
+
+    if args.from_sessionid:
+        sid = os.environ.get("IG_SESSIONID", "").strip()
+        if not sid:
+            print("Задайте змінну IG_SESSIONID (значення cookie sessionid з браузера).")
+            return 1
+        c = Client()
+        c.delay_range = [2, 6]
+        c.login_by_sessionid(unquote(sid))
+        c.dump_settings(SESSION_FILE)
+        print("Готово: session.json створено із sessionid.")
+        return 0
 
     if args.login_only:
         login()
