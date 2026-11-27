@@ -100,15 +100,14 @@ def login() -> Client:
     if SESSION_FILE.exists():
         try:
             cl.load_settings(SESSION_FILE)
-            cl.login(username, password, verification_code=code_for(cl))
-            cl.get_timeline_feed()  # перевірка, що сесія жива
+            cl.get_timeline_feed()  # якщо сесія жива, повторний вхід за паролем не потрібен
             cl.dump_settings(SESSION_FILE)
-            log.info("Вхід через збережену сесію")
+            log.info("Збережена сесія працює, вхід за паролем не потрібен")
             return cl
         except ChallengeRequired:
             raise
         except Exception as e:
-            log.warning("Стара сесія не підійшла (%s), входжу заново", type(e).__name__)
+            log.warning("Збережена сесія не працює (%s), пробую вхід за паролем", type(e).__name__)
             cl = fresh_client()
 
     cl.login(username, password, verification_code=code_for(cl))
@@ -282,6 +281,13 @@ def main() -> int:
         set_blocked(state, 6)
         return 0
     except (PleaseWaitFewMinutes, RateLimitError):
+        set_blocked(state, BLOCK_HOURS)
+        return 0
+    except Exception as e:
+        log.error(
+            "Не вдалося увійти (%s: %s). Імовірно, Instagram не приймає вхід з IP-адреси GitHub. "
+            "Створіть сесію на своєму комп'ютері (--login-only) і додайте її в секрет IG_SESSION_B64. "
+            "Наступна спроба через %s год.", type(e).__name__, e, BLOCK_HOURS)
         set_blocked(state, BLOCK_HOURS)
         return 0
 
