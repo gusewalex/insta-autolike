@@ -55,8 +55,16 @@ jobs:
           if [ -f state.enc ]; then
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in state.enc | tar -xz
           fi
-          if [ ! -f session.json ] && [ -n "$IG_SESSION_B64" ]; then
+          if [ -n "$IG_SESSION_B64" ]; then
+            echo "Секрет IG_SESSION_B64: заданий (довжина ${#IG_SESSION_B64} символів)"
+          else
+            echo "Секрет IG_SESSION_B64: НЕ заданий або порожній"
+          fi
+          if [ -f session.json ]; then
+            echo "session.json узято з кешу"
+          elif [ -n "$IG_SESSION_B64" ]; then
             echo "$IG_SESSION_B64" | base64 -d > session.json
+            echo "session.json створено із секрету"
           fi
 
       - name: Run
