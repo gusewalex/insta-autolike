@@ -36,9 +36,13 @@ from instagrapi.extractors import extract_media_v1
 # ---------- Налаштування ----------
 LIKE_DELAY_MIN = 5              # лайкаємо через стільки хвилин після публікації
 LIKE_JITTER_MAX_MIN = 6         # + випадкові 0..N хвилин
-MAX_POST_AGE_MIN = 3000          # не лайкаємо пости старші за стільки хвилин
+MAX_POST_AGE_MIN = int(os.environ.get("MAX_POST_AGE_MIN", "3000"))  # не лайкаємо пости старші за стільки хвилин (3000 = ~50 год; 0 = без обмеження)
 MAX_LIKES_PER_HOUR = 20         # запобіжник
 SKIP_PROBABILITY = 0.1          # частку постів випадково пропускаємо
+WATCH_MODE = os.environ.get("WATCH_MODE", "both")           # звідки брати пости: feed (стрічка) | profiles (профілі підписок) | both
+PROFILES_PER_PASS = int(os.environ.get("PROFILES_PER_PASS", "8"))  # скільки профілів підписок перевіряти за один прохід (по колу)
+PROFILE_POSTS = int(os.environ.get("PROFILE_POSTS", "6"))   # скільки останніх постів брати з кожного профілю (з запасом на закріплені)
+MAX_EXISTING_LIKES = int(os.environ.get("MAX_EXISTING_LIKES", "0"))  # лайкаємо лише пости, де лайків не більше N (0 = лише без лайків, -1 = вимкнути фільтр)
 # Тиха година вимкнена (працюємо цілодобово). Щоб увімкнути, додайте в workflow змінну, наприклад QUIET_HOURS: "1-7".
 _q = os.environ.get("QUIET_HOURS", "").strip()
 QUIET_HOURS = tuple(int(x) for x in _q.split("-")) if _q else None
@@ -160,7 +164,7 @@ def fetch_feed_posts(cl: Client, pages: int = 2):
             if not raw or raw.get("ad_id"):
                 continue
             try:
-                yield extract_media_v1(raw)
+                yield extract_media_v1(raw), bool(raw.get("like_and_view_counts_disabled"))
             except Exception:
                 continue
         max_id = feed.get("next_max_id")
@@ -177,46 +181,119 @@ def in_quiet_hours() -> bool:
 
 
 def poll_feed(cl: Client, following: set[int], state: dict) -> None:
+    """Збирає нові пости зі стрічки та/або напряму з профілів підписок і ставить їх у чергу на лайк."""
     now = utcnow()
     stats = {"усього": 0, "не від підписок": 0, "вже лайкнуто": 0,
-             "старші за ліміт": 0, "пропущено випадково": 0, "вже в черзі/оброблено": 0, "додано в чергу": 0}
+             "старші за ліміт": 0, "вже є лайки": 0, "лічильник прихований": 0,
+             "пропущено випадково": 0, "вже в черзі/оброблено": 0, "додано в чергу": 0,
+             "з профілів": 0}
     newest_age = None
-    for media in fetch_feed_posts(cl):
-        stats["усього"] += 1
+
+    def consider(media, hidden: bool) -> None:
         pk = str(media.pk)
         age_min = (now - media.taken_at).total_seconds() / 60
-        newest_age = age_min if newest_age is None else min(newest_age, age_min)
-
         if pk in state["scheduled"] or pk in state["done"]:
             stats["вже в черзі/оброблено"] += 1
-            continue
-        if int(media.user.pk) not in following:
-            stats["не від підписок"] += 1
-            continue  # рекомендації не від підписок
+            return
         if media.has_liked:
             stats["вже лайкнуто"] += 1
             state["done"].append(pk)
-            continue
-        if age_min > MAX_POST_AGE_MIN:
+            return
+        if MAX_POST_AGE_MIN > 0 and age_min > MAX_POST_AGE_MIN:
             stats["старші за ліміт"] += 1
             state["done"].append(pk)
-            continue
+            return
+        if MAX_EXISTING_LIKES >= 0:
+            if hidden:
+                stats["лічильник прихований"] += 1
+                state["done"].append(pk)
+                return
+            if media.like_count > MAX_EXISTING_LIKES:
+                stats["вже є лайки"] += 1
+                state["done"].append(pk)
+                return
         if random.random() < SKIP_PROBABILITY:
             stats["пропущено випадково"] += 1
             state["done"].append(pk)
-            continue
+            return
 
         due = media.taken_at + timedelta(minutes=LIKE_DELAY_MIN + random.uniform(0, LIKE_JITTER_MAX_MIN))
         due = max(due, now + timedelta(seconds=random.uniform(5, 60)))
         state["scheduled"][pk] = due.isoformat()
         stats["додано в чергу"] += 1
-        who = f"@{media.user.username}" if LOG_USERNAMES else "акаунта зі стрічки"
-        log.info("У чергу: пост від %s, лайк о %s UTC", who, due.strftime("%H:%M:%S"))
+        who = f"@{media.user.username}" if LOG_USERNAMES else "акаунта з підписок"
+        log.info("У чергу: пост від %s (віком %.0f хв), лайк о %s UTC", who, age_min, due.strftime("%H:%M:%S"))
+
+    if WATCH_MODE in ("feed", "both"):
+        for media, hidden in fetch_feed_posts(cl):
+            stats["усього"] += 1
+            age_min = (now - media.taken_at).total_seconds() / 60
+            newest_age = age_min if newest_age is None else min(newest_age, age_min)
+            if int(media.user.pk) not in following:
+                stats["не від підписок"] += 1
+                continue  # рекомендації не від підписок
+            consider(media, hidden)
+
+    if WATCH_MODE in ("profiles", "both"):
+        poll_profiles(cl, following, state, stats, consider)
 
     log.info("Стрічка: %s", ", ".join(f"{k}={v}" for k, v in stats.items()))
     if newest_age is not None:
         log.info("Найновіший пост у стрічці опублікований %.0f хв тому", newest_age)
     save_state(state)
+
+
+def poll_profiles(cl: Client, following: set[int], state: dict, stats: dict, consider) -> None:
+    """Напряму перевіряє останні пости частини акаунтів, на які ви підписані (по колу, щоб не робити забагато запитів)."""
+    ids = sorted(following)
+    if not ids:
+        return
+    cur = state.get("watch_cursor", 0) % len(ids)
+    batch = [ids[(cur + i) % len(ids)] for i in range(min(PROFILES_PER_PASS, len(ids)))]
+    state["watch_cursor"] = (cur + len(batch)) % len(ids)
+
+    checked = 0
+    for uid in batch:
+        try:
+            try:
+                medias = cl.user_medias_v1(uid, amount=PROFILE_POSTS)
+            except TypeError:
+                medias = cl.user_medias(uid, amount=PROFILE_POSTS)
+        except IG_LIMIT_ERRORS:
+            raise
+        except Exception as e:
+            log.warning("Не вдалося прочитати профіль (%s)", type(e).__name__)
+            continue
+        checked += 1
+        for media in medias:
+            stats["з профілів"] += 1
+            consider(media, False)
+        time.sleep(random.uniform(1.5, 4))
+    log.info("Перевірено профілів напряму: %d з %d (наступний прохід продовжить по колу)", checked, len(ids))
+
+
+IG_LIMIT_ERRORS = (LoginRequired, ChallengeRequired, PleaseWaitFewMinutes, RateLimitError, FeedbackRequired)
+
+
+def still_unliked(cl: Client, pk: str) -> bool:
+    """Перед лайком перевіряємо актуальну кількість лайків: за кілька хвилин вони могли з'явитися."""
+    try:
+        try:
+            info = cl.media_info(pk, use_cache=False)
+        except TypeError:
+            info = cl.media_info(pk)
+    except IG_LIMIT_ERRORS:
+        raise
+    except Exception as e:
+        log.warning("Не вдалося перевірити лайки поста (%s), пропускаю", type(e).__name__)
+        return False
+    if info.has_liked:
+        log.info("Пост уже лайкнуто, пропускаю")
+        return False
+    if info.like_count > MAX_EXISTING_LIKES:
+        log.info("На пості вже є лайки (%d), пропускаю", info.like_count)
+        return False
+    return True
 
 
 def process_due(cl: Client, state: dict, like_times: list[datetime]) -> None:
@@ -227,12 +304,17 @@ def process_due(cl: Client, state: dict, like_times: list[datetime]) -> None:
         due = datetime.fromisoformat(due_iso)
         if due > utcnow():
             continue
-        if utcnow() - due > timedelta(minutes=MAX_POST_AGE_MIN):
+        if MAX_POST_AGE_MIN > 0 and utcnow() - due > timedelta(minutes=MAX_POST_AGE_MIN):
             state["scheduled"].pop(pk)
             state["done"].append(pk)
             continue
         if len(like_times) >= MAX_LIKES_PER_HOUR or in_quiet_hours():
             break
+        if MAX_EXISTING_LIKES >= 0 and not still_unliked(cl, pk):
+            state["scheduled"].pop(pk, None)
+            state["done"].append(pk)
+            save_state(state)
+            continue
         try:
             ok = cl.media_like(int(pk))
             log.info("Лайк поставлено" if ok else "Лайк не вдався")
